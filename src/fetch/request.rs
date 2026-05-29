@@ -7,7 +7,8 @@ use reqwest::header::HeaderMap;
 ///
 /// Anything set here takes priority over the [`Fetch`](super::Fetch) struct's own configuration for that one request;
 /// anything left unset is inherited from the struct. Headers are merged per-key (request values override struct
-/// values, other struct headers are preserved), query parameters are appended, and the method defaults to `GET`.
+/// values, other struct headers are preserved), query parameters are appended, and the method defaults to `GET`. A
+/// JSON request body can be attached with [`RequestOptions::body`].
 ///
 /// ```
 /// use rust_sak::fetch::RequestOptions;
@@ -32,6 +33,8 @@ pub struct RequestOptions {
     /// HTTP/2 toggle override. `None` inherits the struct's setting; `Some(true)` forces HTTP/1.x, `Some(false)`
     /// forces HTTP/2 even if the struct disabled it.
     pub(super) disable_http2: Option<bool>,
+    /// JSON request body, serialized eagerly by [`RequestOptions::body`]. `None` sends no body.
+    pub(super) body: Option<serde_json::Value>,
 }
 
 impl RequestOptions {
@@ -89,6 +92,17 @@ impl RequestOptions {
         self.disable_http2 = Some(disable);
         self
     }
+
+    /// Sets a JSON request body, serialized from `body`. Applied by both [`Fetch::text`](super::Fetch::text) and
+    /// [`Fetch::json`](super::Fetch::json), which send it with a `Content-Type: application/json` header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `body` cannot be serialized to JSON.
+    pub fn body<T: serde::Serialize>(mut self, body: T) -> Self {
+        self.body = Some(serde_json::to_value(body).expect("request body is not serializable to JSON"));
+        self
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +117,7 @@ mod tests {
         assert!(options.query.is_empty());
         assert!(options.retries.is_none());
         assert!(options.disable_http2.is_none());
+        assert!(options.body.is_none());
     }
 
     #[test]
@@ -113,7 +128,8 @@ mod tests {
             .query("a", "1")
             .query("b", "2")
             .retries(4)
-            .disable_http2(true);
+            .disable_http2(true)
+            .body(serde_json::json!({ "name": "rust" }));
 
         assert_eq!(options.method, Some(reqwest::Method::POST));
         assert_eq!(options.headers.get("Accept").unwrap(), "application/json");
@@ -123,6 +139,7 @@ mod tests {
         );
         assert_eq!(options.retries, Some(4));
         assert_eq!(options.disable_http2, Some(true));
+        assert_eq!(options.body, Some(serde_json::json!({ "name": "rust" })));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! HTTP fetching utilities.
 //!
 //! This module exposes [`Fetch`], a configurable HTTP request builder. It holds the default configuration (headers,
-//! retries, HTTP/2 toggle) and sends requests via [`Fetch::text`], retrying with Fibonacci backoff. Individual
-//! requests can override the defaults by passing [`RequestOptions`].
+//! retries, HTTP/2 toggle) and sends requests via [`Fetch::text`] (raw body) or [`Fetch::json`] (deserialized into a
+//! caller-chosen type), retrying with Fibonacci backoff. Individual requests can override the defaults — including
+//! attaching a JSON request body — by passing [`RequestOptions`].
 
 mod request;
 mod retry;
@@ -93,13 +94,44 @@ impl Fetch {
         self
     }
 
+    /// Builds the HTTP client and resolves the per-request settings shared by [`Fetch::text`] and [`Fetch::json`].
+    ///
+    /// Headers are merged per-key (request values override struct values, other struct headers are preserved), the
+    /// HTTP/2 toggle and retry count falls back to the struct's, the method defaults to `GET`, and the optional JSON
+    /// body is carried through verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`reqwest::Error`] if the client cannot be built or `url` is invalid.
+    fn prepare(self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<PreparedRequest, reqwest::Error> {
+        let mut headers = self.headers;
+        for (name, value) in options.headers.iter() {
+            headers.insert(name.clone(), value.clone());
+        }
+
+        let mut builder = reqwest::Client::builder().default_headers(headers);
+
+        if options.disable_http2.unwrap_or(self.disable_http2) {
+            builder = builder.http1_only();
+        }
+
+        Ok(PreparedRequest {
+            client: builder.build()?,
+            url: url.into_url()?,
+            method: options.method.unwrap_or(reqwest::Method::GET),
+            query: options.query,
+            body: options.body,
+            retries: options.retries.unwrap_or(self.retries),
+        })
+    }
+
     /// Sends a request to `url` and returns the response body as a `String`.
     ///
     /// The struct's headers, retry count, and HTTP/2 setting provide the defaults; any field set on `options` takes
     /// priority for this one request. Headers are merged per-key (request values override struct values, other struct
-    /// headers are preserved), query parameters from `options` are appended, and the method defaults to `GET`. The
-    /// request is retried up to the resolved number of additional times on failure, with Fibonacci backoff between
-    /// attempts (1s, 2s, 3s, 5s, …).
+    /// headers are preserved), query parameters from `options` are appended, the method defaults to `GET`, and a JSON
+    /// body set via [`RequestOptions::body`] is attached. The request is retried up to the resolved number of
+    /// additional times on failure, with Fibonacci backoff between attempts (1s, 2s, 3s, 5s, …).
     ///
     /// # Errors
     ///
@@ -117,35 +149,86 @@ impl Fetch {
     /// # }
     /// ```
     pub async fn text(self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<String, reqwest::Error> {
-        let mut headers = self.headers;
-        for (name, value) in options.headers.iter() {
-            headers.insert(name.clone(), value.clone());
-        }
-
-        let mut builder = reqwest::Client::builder().default_headers(headers);
-
-        if options.disable_http2.unwrap_or(self.disable_http2) {
-            builder = builder.http1_only();
-        }
-
-        let client = builder.build()?;
-        let url = url.into_url()?;
-        let method = options.method.unwrap_or(reqwest::Method::GET);
-        let query = options.query;
-        let retries = options.retries.unwrap_or(self.retries);
+        let PreparedRequest {
+            client,
+            url,
+            method,
+            query,
+            body,
+            retries,
+        } = self.prepare(url, options)?;
 
         retry::with_fibonacci_backoff(retries, || async {
-            client
-                .request(method.clone(), url.clone())
-                .query(&query)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
+            let mut request = client.request(method.clone(), url.clone()).query(&query);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            request.send().await?.error_for_status()?.text().await
         })
         .await
     }
+
+    /// Sends a request to `url` and deserializes the JSON response body into `T`.
+    ///
+    /// Behaves exactly like [`Fetch::text`] — same header merging, query parameters, optional [`RequestOptions::body`],
+    /// method default, and Fibonacci-backoff retries — but parses the response body as JSON into any type implementing
+    /// [`serde::de::DeserializeOwned`] instead of returning the raw text.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
+    /// cannot be deserialized into `T`.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// use rust_sak::fetch::{Fetch, RequestOptions};
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct Repo {
+    ///     name: String,
+    ///     stargazers_count: u32,
+    /// }
+    ///
+    /// let repo: Repo = Fetch::new()
+    ///     .header("Accept", "application/json")
+    ///     .json("https://api.github.com/repos/rust-lang/rust", RequestOptions::new())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn json<T: serde::de::DeserializeOwned>(
+        self,
+        url: impl reqwest::IntoUrl,
+        options: RequestOptions,
+    ) -> Result<T, reqwest::Error> {
+        let PreparedRequest {
+            client,
+            url,
+            method,
+            query,
+            body,
+            retries,
+        } = self.prepare(url, options)?;
+
+        retry::with_fibonacci_backoff(retries, || async {
+            let mut request = client.request(method.clone(), url.clone()).query(&query);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            request.send().await?.error_for_status()?.json::<T>().await
+        })
+        .await
+    }
+}
+
+/// Client and resolved per-request settings produced by [`Fetch::prepare`], consumed by the request methods.
+struct PreparedRequest {
+    client: reqwest::Client,
+    url: reqwest::Url,
+    method: reqwest::Method,
+    query: Vec<(String, String)>,
+    body: Option<serde_json::Value>,
+    retries: u32,
 }
 
 #[cfg(test)]
@@ -445,5 +528,92 @@ mod tests {
 
         assert_eq!(body, "recovered");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn json_deserializes_body() {
+        #[derive(serde::Deserialize)]
+        struct Repo {
+            name: String,
+            stars: u32,
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", r#"{"name":"rust-sak","stars":42}"#).await;
+        });
+
+        let repo: Repo = Fetch::new()
+            .json(format!("http://{addr}"), RequestOptions::new())
+            .await
+            .unwrap();
+
+        assert_eq!(repo.name, "rust-sak");
+        assert_eq!(repo.stars, 42);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn json_errors_on_invalid_json() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "not json").await;
+        });
+
+        let result = Fetch::new()
+            .json::<serde_json::Value>(format!("http://{addr}"), RequestOptions::new())
+            .await;
+
+        assert!(result.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn text_sends_request_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Read the full request including the body that follows the headers.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                // Once the headers are in, read whatever body bytes arrived with them.
+                if n < chunk.len() || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write_response(&mut stream, "200 OK", "ok").await;
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let body = Fetch::new()
+            .text(
+                format!("http://{addr}"),
+                RequestOptions::new()
+                    .method(reqwest::Method::POST)
+                    .body(serde_json::json!({ "name": "rust" })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body, "ok");
+        let request = server.await.unwrap();
+        assert!(
+            request.to_lowercase().contains("content-type: application/json"),
+            "request was:\n{request}"
+        );
+        assert!(request.contains(r#"{"name":"rust"}"#), "request was:\n{request}");
     }
 }
