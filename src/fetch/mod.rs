@@ -1,11 +1,33 @@
 //! HTTP fetching utilities.
 //!
-//! This module exposes [`Fetch`], a configurable HTTP request builder. It holds configuration (headers, retries,
-//! HTTP/2 toggle) and can send GET requests via [`Fetch::get_text`], retrying with Fibonacci backoff.
+//! This module exposes [`Fetch`], a configurable HTTP request builder. It holds the default configuration (headers,
+//! retries, HTTP/2 toggle) and sends requests via [`Fetch::text`], retrying with Fibonacci backoff. Individual
+//! requests can override the defaults by passing [`RequestOptions`].
 
+mod request;
 mod retry;
 
+pub use request::RequestOptions;
+
 use reqwest::header::HeaderMap;
+
+/// Inserts `key`/`value` into `map`, converting both and panicking on invalid input. Shared by the `header` builder
+/// methods on [`Fetch`] and [`RequestOptions`].
+///
+/// # Panics
+///
+/// Panics if `key` is not a valid header name or `value` is not a valid header value.
+fn insert_header<K, V>(map: &mut HeaderMap, key: K, value: V)
+where
+    K: TryInto<reqwest::header::HeaderName>,
+    K::Error: std::fmt::Debug,
+    V: TryInto<reqwest::header::HeaderValue>,
+    V::Error: std::fmt::Debug,
+{
+    let key = key.try_into().expect("invalid header name");
+    let value = value.try_into().expect("invalid header value");
+    map.insert(key, value);
+}
 
 /// A configurable HTTP fetcher, built with a fluent (consuming) builder API.
 ///
@@ -15,7 +37,7 @@ use reqwest::header::HeaderMap;
 /// let fetch = Fetch::new()
 ///     .header("Accept", "application/json")
 ///     .retries(3)
-///     .disable_http2();
+///     .disable_http2(true);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Fetch {
@@ -49,9 +71,7 @@ impl Fetch {
         V: TryInto<reqwest::header::HeaderValue>,
         V::Error: std::fmt::Debug,
     {
-        let key = key.try_into().expect("invalid header name");
-        let value = value.try_into().expect("invalid header value");
-        self.headers.insert(key, value);
+        insert_header(&mut self.headers, key, value);
         self
     }
 
@@ -67,16 +87,19 @@ impl Fetch {
         self
     }
 
-    /// Forces requests over HTTP/1.x, disabling HTTP/2.
-    pub fn disable_http2(mut self) -> Self {
-        self.disable_http2 = true;
+    /// Sets the HTTP/2 toggle: `true` forces requests over HTTP/1.x, `false` keeps HTTP/2 enabled.
+    pub fn disable_http2(mut self, disable: bool) -> Self {
+        self.disable_http2 = disable;
         self
     }
 
-    /// Sends a GET request to `url` and returns the response body as a `String`.
+    /// Sends a request to `url` and returns the response body as a `String`.
     ///
-    /// The configured headers and HTTP/2 setting are applied to the client, and the request is retried up to
-    /// [`Fetch::retries`] additional times on failure, with Fibonacci backoff between attempts (1s, 2s, 3s, 5s, …).
+    /// The struct's headers, retry count, and HTTP/2 setting provide the defaults; any field set on `options` takes
+    /// priority for this one request. Headers are merged per-key (request values override struct values, other struct
+    /// headers are preserved), query parameters from `options` are appended, and the method defaults to `GET`. The
+    /// request is retried up to the resolved number of additional times on failure, with Fibonacci backoff between
+    /// attempts (1s, 2s, 3s, 5s, …).
     ///
     /// # Errors
     ///
@@ -85,26 +108,41 @@ impl Fetch {
     ///
     /// ```no_run
     /// # async fn run() -> Result<(), reqwest::Error> {
-    /// use rust_sak::fetch::Fetch;
+    /// use rust_sak::fetch::{Fetch, RequestOptions};
     ///
     /// let body = Fetch::new()
-    ///     .get_text("https://example.com")
+    ///     .text("https://example.com", RequestOptions::new().query("q", "rust"))
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn get_text(self, url: impl reqwest::IntoUrl) -> Result<String, reqwest::Error> {
-        let mut builder = reqwest::Client::builder().default_headers(self.headers);
+    pub async fn text(self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<String, reqwest::Error> {
+        let mut headers = self.headers;
+        for (name, value) in options.headers.iter() {
+            headers.insert(name.clone(), value.clone());
+        }
 
-        if self.disable_http2 {
+        let mut builder = reqwest::Client::builder().default_headers(headers);
+
+        if options.disable_http2.unwrap_or(self.disable_http2) {
             builder = builder.http1_only();
         }
 
         let client = builder.build()?;
         let url = url.into_url()?;
+        let method = options.method.unwrap_or(reqwest::Method::GET);
+        let query = options.query;
+        let retries = options.retries.unwrap_or(self.retries);
 
-        retry::with_fibonacci_backoff(self.retries, || async {
-            client.get(url.clone()).send().await?.error_for_status()?.text().await
+        retry::with_fibonacci_backoff(retries, || async {
+            client
+                .request(method.clone(), url.clone())
+                .query(&query)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
         })
         .await
     }
@@ -127,11 +165,18 @@ mod tests {
         let fetch = Fetch::new()
             .header("Accept", "application/json")
             .retries(3)
-            .disable_http2();
+            .disable_http2(true);
 
         assert_eq!(fetch.headers.get("Accept").unwrap(), "application/json");
         assert_eq!(fetch.retries, 3);
         assert!(fetch.disable_http2);
+    }
+
+    #[test]
+    fn disable_http2_can_re_enable() {
+        assert!(!Fetch::new().disable_http2(false).disable_http2);
+        assert!(Fetch::new().disable_http2(false).disable_http2(true).disable_http2);
+        assert!(!Fetch::new().disable_http2(true).disable_http2(false).disable_http2);
     }
 
     #[test]
@@ -143,9 +188,9 @@ mod tests {
         assert_eq!(fetch.headers.get("X-Test").unwrap(), "1");
     }
 
-    // --- get_text tests ---
+    // --- text tests ---
     //
-    // These spin up a throwaway local HTTP/1.1 server on an ephemeral port and point `get_text` at it, so they
+    // These spin up a throwaway local HTTP/1.1 server on an ephemeral port and point `text` at it, so they
     // exercise the real request path without reaching the network.
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -179,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_text_returns_body() {
+    async fn text_returns_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -189,14 +234,17 @@ mod tests {
             write_response(&mut stream, "200 OK", "hello world").await;
         });
 
-        let body = Fetch::new().get_text(format!("http://{addr}")).await.unwrap();
+        let body = Fetch::new()
+            .text(format!("http://{addr}"), RequestOptions::new())
+            .await
+            .unwrap();
 
         assert_eq!(body, "hello world");
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn get_text_sends_configured_headers() {
+    async fn text_sends_configured_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -209,7 +257,7 @@ mod tests {
 
         let body = Fetch::new()
             .header("X-Custom", "abc123")
-            .get_text(format!("http://{addr}"))
+            .text(format!("http://{addr}"), RequestOptions::new())
             .await
             .unwrap();
 
@@ -222,7 +270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_text_errors_on_failure_status() {
+    async fn text_errors_on_failure_status() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -232,14 +280,17 @@ mod tests {
             write_response(&mut stream, "500 Internal Server Error", "nope").await;
         });
 
-        let err = Fetch::new().get_text(format!("http://{addr}")).await.unwrap_err();
+        let err = Fetch::new()
+            .text(format!("http://{addr}"), RequestOptions::new())
+            .await
+            .unwrap_err();
 
         assert_eq!(err.status(), Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn get_text_retries_until_success() {
+    async fn text_retries_until_success() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -256,7 +307,139 @@ mod tests {
 
         let body = Fetch::new()
             .retries(1)
-            .get_text(format!("http://{addr}"))
+            .text(format!("http://{addr}"), RequestOptions::new())
+            .await
+            .unwrap();
+
+        assert_eq!(body, "recovered");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn text_appends_query_params() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "ok").await;
+            request
+        });
+
+        let body = Fetch::new()
+            .text(
+                format!("http://{addr}"),
+                RequestOptions::new().query("a", "1").query("b", "2"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body, "ok");
+        let request = server.await.unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.contains("?a=1&b=2"), "request line was:\n{request_line}");
+    }
+
+    #[tokio::test]
+    async fn text_uses_per_request_method() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "ok").await;
+            request
+        });
+
+        let body = Fetch::new()
+            .text(
+                format!("http://{addr}"),
+                RequestOptions::new().method(reqwest::Method::POST),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body, "ok");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST "), "request was:\n{request}");
+    }
+
+    #[tokio::test]
+    async fn text_request_header_overrides_struct_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "ok").await;
+            request
+        });
+
+        let body = Fetch::new()
+            .header("X-Custom", "from-fetch")
+            .text(
+                format!("http://{addr}"),
+                RequestOptions::new().header("X-Custom", "from-request"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body, "ok");
+        let request = server.await.unwrap().to_lowercase();
+        assert!(request.contains("x-custom: from-request"), "request was:\n{request}");
+        assert!(!request.contains("from-fetch"), "request was:\n{request}");
+    }
+
+    #[tokio::test]
+    async fn text_merges_struct_and_request_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "ok").await;
+            request
+        });
+
+        let body = Fetch::new()
+            .header("X-From-Fetch", "fetch")
+            .text(
+                format!("http://{addr}"),
+                RequestOptions::new().header("X-From-Request", "request"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body, "ok");
+        let request = server.await.unwrap().to_lowercase();
+        assert!(request.contains("x-from-fetch: fetch"), "request was:\n{request}");
+        assert!(request.contains("x-from-request: request"), "request was:\n{request}");
+    }
+
+    #[tokio::test]
+    async fn text_per_request_retries_override() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // First attempt fails...
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "500 Internal Server Error", "fail").await;
+            // ...the per-request retry succeeds.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "recovered").await;
+        });
+
+        // The struct disables retries; the per-request override re-enables one.
+        let body = Fetch::new()
+            .retries(0)
+            .text(format!("http://{addr}"), RequestOptions::new().retries(1))
             .await
             .unwrap();
 
