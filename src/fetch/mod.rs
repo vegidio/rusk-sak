@@ -2,12 +2,16 @@
 //!
 //! This module exposes [`Fetch`], a configurable HTTP request builder. It holds the default configuration (headers,
 //! retries, HTTP/2 toggle) and sends requests via [`Fetch::text`] (raw body) or [`Fetch::json`] (deserialized into a
-//! caller-chosen type), retrying with Fibonacci backoff. Individual requests can override the defaults — including
-//! attaching a JSON request body — by passing [`RequestOptions`].
+//! caller-chosen type), retrying with Fibonacci backoff. [`Fetch::download`] instead streams a response body to a file
+//! and returns a [`Download`] handle immediately, exposing live progress as a [`Progress`] snapshot (and surfacing
+//! failures as a [`DownloadError`]). Individual requests can override the defaults — including attaching a JSON request
+//! body — by passing [`RequestOptions`].
 
+mod download;
 mod request;
 mod retry;
 
+pub use download::{Download, DownloadError, Progress};
 pub use request::RequestOptions;
 
 use reqwest::header::HeaderMap;
@@ -218,6 +222,60 @@ impl Fetch {
             request.send().await?.error_for_status()?.json::<T>().await
         })
         .await
+    }
+
+    /// Streams a request to `url`, writing the response body to `path`, and returns a [`Download`] handle immediately.
+    ///
+    /// Unlike [`Fetch::text`] and [`Fetch::json`], this does **not** await the transfer: the download runs in a
+    /// background task while the body is streamed to disk chunk-by-chunk (never buffered whole in memory). The returned
+    /// [`Download`] tracks live progress — total size, bytes downloaded, completion fraction — via
+    /// [`Download::progress`], and exposes the final outcome via [`Download::completed`], [`Download::failed`], and
+    /// [`Download::join`].
+    ///
+    /// The struct's headers, retry count, and HTTP/2 setting provide the defaults, with `options` overriding per the
+    /// same rules as [`Fetch::text`]. On a retry the whole transfer restarts: the file is truncated and re-downloaded
+    /// from byte zero (there is no `Range`/resume support), so the observed progress briefly resets.
+    ///
+    /// All fallible setup is deferred into the background task, so failures — an invalid URL, a client-build error, a
+    /// bad HTTP status, a stream error, or a disk-write error — surface through [`Download::failed`]/[`Download::join`]
+    /// as a [`DownloadError`] rather than from this call.
+    ///
+    /// # Panics
+    ///
+    /// Must be called from within a Tokio runtime (it spawns a task); panics otherwise.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// use rust_sak::fetch::{Fetch, RequestOptions};
+    ///
+    /// let mut download = Fetch::new().download(
+    ///     "https://example.com/big.bin",
+    ///     "/tmp/big.bin",
+    ///     RequestOptions::new(),
+    /// );
+    ///
+    /// while !download.completed() {
+    ///     let progress = download.progress();
+    ///     if let Some(fraction) = progress.progress {
+    ///         println!("{:.0}%", fraction * 100.0);
+    ///     }
+    ///     download.changed().await.ok();
+    /// }
+    /// download.join().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn download(
+        self,
+        url: impl reqwest::IntoUrl,
+        path: impl AsRef<std::path::Path>,
+        options: RequestOptions,
+    ) -> Download {
+        let url = url.into_url();
+        let path = path.as_ref().to_path_buf();
+        let (tx, rx) = tokio::sync::watch::channel(Progress::default());
+        let handle = tokio::spawn(download::run(self, url, path, options, tx));
+        Download::from_parts(rx, handle)
     }
 }
 
