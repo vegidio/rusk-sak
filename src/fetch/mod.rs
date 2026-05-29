@@ -11,8 +11,14 @@ mod download;
 mod request;
 mod retry;
 
+#[cfg(test)]
+mod test_support;
+
 pub use download::{Download, DownloadError, Progress};
 pub use request::RequestOptions;
+
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use reqwest::header::HeaderMap;
 
@@ -34,7 +40,12 @@ where
     map.insert(key, value);
 }
 
-/// A configurable HTTP fetcher, built with a fluent (consuming) builder API.
+/// A configurable, reusable HTTP fetcher, built with a fluent (consuming) builder API.
+///
+/// A `Fetch` holds the default configuration (headers, retries, HTTP/2 toggle, read timeout) and a lazily built,
+/// reusable [`reqwest::Client`]. The client — and its connection pool — is constructed on the first request and reused
+/// across later requests, so a `Fetch` is meant to be configured once and shared (the request methods take `&self`).
+/// Mutating the configuration via the builder methods resets the cached client so it is rebuilt with the new settings.
 ///
 /// ```
 /// use rust_sak::fetch::Fetch;
@@ -44,7 +55,7 @@ where
 ///     .retries(3)
 ///     .disable_http2(true);
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct Fetch {
     /// Headers sent with every request.
     headers: HeaderMap,
@@ -52,15 +63,48 @@ pub struct Fetch {
     retries: u32,
     /// When `true`, requests are forced over HTTP/1.x instead of HTTP/2.
     disable_http2: bool,
+    /// Idle timeout applied per read: a request errors if no data arrives within this window (the timer resets on each
+    /// successful read). `None` disables it. Defaults to 30 seconds.
+    read_timeout: Option<Duration>,
+    /// Lazily built, reused HTTP client. Cleared by the config builders, so the next request rebuilds it.
+    client: OnceLock<reqwest::Client>,
+}
+
+impl Default for Fetch {
+    /// The default configuration: no headers, no retries, HTTP/2 enabled, and a 30-second read (idle) timeout.
+    fn default() -> Self {
+        Self {
+            headers: HeaderMap::new(),
+            retries: 0,
+            disable_http2: false,
+            read_timeout: Some(Duration::from_secs(30)),
+            client: OnceLock::new(),
+        }
+    }
+}
+
+impl Clone for Fetch {
+    /// Clones the configuration; the cloned `Fetch` starts with an empty client cache (a fresh client is built on its
+    /// first request).
+    fn clone(&self) -> Self {
+        Self {
+            headers: self.headers.clone(),
+            retries: self.retries,
+            disable_http2: self.disable_http2,
+            read_timeout: self.read_timeout,
+            client: OnceLock::new(),
+        }
+    }
 }
 
 impl Fetch {
-    /// Creates a new [`Fetch`] with the default configuration: no headers, no retries, and HTTP/2 enabled.
+    /// Creates a new [`Fetch`] with the default configuration: no headers, no retries, HTTP/2 enabled, and a
+    /// 30-second read (idle) timeout.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Inserts a single header.
+    /// Inserts a single header sent with every request.
     ///
     /// Accepts anything convertible into a header name and value (e.g. `&str`).
     ///
@@ -77,12 +121,14 @@ impl Fetch {
         V::Error: std::fmt::Debug,
     {
         insert_header(&mut self.headers, key, value);
+        self.client = OnceLock::new();
         self
     }
 
     /// Replaces the full set of headers.
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
+        self.client = OnceLock::new();
         self
     }
 
@@ -95,37 +141,85 @@ impl Fetch {
     /// Sets the HTTP/2 toggle: `true` forces requests over HTTP/1.x, `false` keeps HTTP/2 enabled.
     pub fn disable_http2(mut self, disable: bool) -> Self {
         self.disable_http2 = disable;
+        self.client = OnceLock::new();
         self
     }
 
-    /// Builds the HTTP client and resolves the per-request settings shared by [`Fetch::text`] and [`Fetch::json`].
+    /// Sets the read (idle) timeout applied to every request.
     ///
-    /// Headers are merged per-key (request values override struct values, other struct headers are preserved), the
-    /// HTTP/2 toggle and retry count falls back to the struct's, the method defaults to `GET`, and the optional JSON
-    /// body is carried through verbatim.
+    /// The timeout is applied to each read operation and **resets after each successful read**, so it bounds how long a
+    /// connection may stall without sending data — not the total duration of a request. A slow but steady transfer
+    /// (e.g. a large download) never trips it. Pass a [`Duration`] to set it or `None` to disable it. Defaults to 30
+    /// seconds.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// let fetch = Fetch::new().read_timeout(Duration::from_secs(10)); // tighter idle timeout
+    /// let patient = Fetch::new().read_timeout(None); // no idle timeout
+    /// ```
+    pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.read_timeout = timeout.into();
+        self.client = OnceLock::new();
+        self
+    }
+
+    /// Returns the cached HTTP client, building it from the current configuration on first use.
+    ///
+    /// The struct's headers become the client's default headers, the HTTP/2 toggle and read timeout are applied at
+    /// build time, and the result is cached for reuse across requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`reqwest::Error`] if the client cannot be built.
+    fn client(&self) -> Result<&reqwest::Client, reqwest::Error> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
+
+        let mut builder = reqwest::Client::builder().default_headers(self.headers.clone());
+        if self.disable_http2 {
+            builder = builder.http1_only();
+        }
+        if let Some(timeout) = self.read_timeout {
+            builder = builder.read_timeout(timeout);
+        }
+
+        let client = builder.build()?;
+        Ok(self.client.get_or_init(|| client))
+    }
+
+    /// Resolves the per-request settings shared by [`Fetch::text`], [`Fetch::json`], and [`Fetch::download`] against
+    /// the reused client.
+    ///
+    /// The method defaults to `GET`; per-request headers are carried through to be applied at the request level (where
+    /// they override the client's default headers per-key); the retry count falls back to the struct's. Automatic
+    /// retries are restricted to idempotent methods unless [`RequestOptions::retry_non_idempotent`] opts in, so the
+    /// resolved retry count is forced to zero for a non-idempotent method otherwise.
     ///
     /// # Errors
     ///
     /// Returns a [`reqwest::Error`] if the client cannot be built or `url` is invalid.
-    fn prepare(self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<PreparedRequest, reqwest::Error> {
-        let mut headers = self.headers;
-        for (name, value) in options.headers.iter() {
-            headers.insert(name.clone(), value.clone());
-        }
+    fn prepare(&self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<PreparedRequest, reqwest::Error> {
+        let client = self.client()?.clone();
+        let method = options.method.unwrap_or(reqwest::Method::GET);
 
-        let mut builder = reqwest::Client::builder().default_headers(headers);
-
-        if options.disable_http2.unwrap_or(self.disable_http2) {
-            builder = builder.http1_only();
-        }
+        let retries = options.retries.unwrap_or(self.retries);
+        let retries = if is_idempotent(&method) || options.retry_non_idempotent {
+            retries
+        } else {
+            0
+        };
 
         Ok(PreparedRequest {
-            client: builder.build()?,
+            client,
             url: url.into_url()?,
-            method: options.method.unwrap_or(reqwest::Method::GET),
+            method,
             query: options.query,
+            headers: options.headers,
             body: options.body,
-            retries: options.retries.unwrap_or(self.retries),
+            retries,
         })
     }
 
@@ -152,22 +246,10 @@ impl Fetch {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn text(self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<String, reqwest::Error> {
-        let PreparedRequest {
-            client,
-            url,
-            method,
-            query,
-            body,
-            retries,
-        } = self.prepare(url, options)?;
-
-        retry::with_fibonacci_backoff(retries, || async {
-            let mut request = client.request(method.clone(), url.clone()).query(&query);
-            if let Some(body) = &body {
-                request = request.json(body);
-            }
-            request.send().await?.error_for_status()?.text().await
+    pub async fn text(&self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<String, reqwest::Error> {
+        let prepared = self.prepare(url, options)?;
+        retry::with_fibonacci_backoff(prepared.retries, || async {
+            prepared.request().send().await?.error_for_status()?.text().await
         })
         .await
     }
@@ -201,25 +283,13 @@ impl Fetch {
     /// # }
     /// ```
     pub async fn json<T: serde::de::DeserializeOwned>(
-        self,
+        &self,
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
     ) -> Result<T, reqwest::Error> {
-        let PreparedRequest {
-            client,
-            url,
-            method,
-            query,
-            body,
-            retries,
-        } = self.prepare(url, options)?;
-
-        retry::with_fibonacci_backoff(retries, || async {
-            let mut request = client.request(method.clone(), url.clone()).query(&query);
-            if let Some(body) = &body {
-                request = request.json(body);
-            }
-            request.send().await?.error_for_status()?.json::<T>().await
+        let prepared = self.prepare(url, options)?;
+        retry::with_fibonacci_backoff(prepared.retries, || async {
+            prepared.request().send().await?.error_for_status()?.json::<T>().await
         })
         .await
     }
@@ -233,12 +303,13 @@ impl Fetch {
     /// [`Download::join`].
     ///
     /// The struct's headers, retry count, and HTTP/2 setting provide the defaults, with `options` overriding per the
-    /// same rules as [`Fetch::text`]. On a retry the whole transfer restarts: the file is truncated and re-downloaded
-    /// from byte zero (there is no `Range`/resume support), so the observed progress briefly resets.
+    /// same rules as [`Fetch::text`] (so non-idempotent methods are not retried unless
+    /// [`RequestOptions::retry_non_idempotent`] opts in). On a retry the whole transfer restarts: the file is truncated
+    /// and re-downloaded from byte zero (there is no `Range`/resume support), so the observed progress briefly resets.
     ///
-    /// All fallible setup is deferred into the background task, so failures — an invalid URL, a client-build error, a
-    /// bad HTTP status, a stream error, or a disk-write error — surface through [`Download::failed`]/[`Download::join`]
-    /// as a [`DownloadError`] rather than from this call.
+    /// All fallible setup is surfaced through the handle rather than from this call: an invalid URL or a client-build
+    /// error is captured and reported, alongside a bad HTTP status, a stream error, or a disk-write error, via
+    /// [`Download::failed`]/[`Download::join`] as a [`DownloadError`].
     ///
     /// # Panics
     ///
@@ -266,27 +337,57 @@ impl Fetch {
     /// # }
     /// ```
     pub fn download(
-        self,
+        &self,
         url: impl reqwest::IntoUrl,
         path: impl AsRef<std::path::Path>,
         options: RequestOptions,
     ) -> Download {
-        let url = url.into_url();
+        let prepared = self.prepare(url, options);
         let path = path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::watch::channel(Progress::default());
-        let handle = tokio::spawn(download::run(self, url, path, options, tx));
+        let handle = tokio::spawn(download::run(prepared, path, tx));
         Download::from_parts(rx, handle)
     }
 }
 
-/// Client and resolved per-request settings produced by [`Fetch::prepare`], consumed by the request methods.
-struct PreparedRequest {
+/// `true` for HTTP methods that are idempotent per RFC 9110 (so safe to retry automatically): `GET`, `HEAD`, `PUT`,
+/// `DELETE`, `OPTIONS`, `TRACE`. `POST` and `PATCH` are not.
+fn is_idempotent(method: &reqwest::Method) -> bool {
+    use reqwest::Method;
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
+/// Client and resolved per-request settings produced by [`Fetch::prepare`], consumed by the request methods. The
+/// embedded [`reqwest::Client`] is a cheap clone of the reused client (it shares the underlying connection pool).
+pub(super) struct PreparedRequest {
     client: reqwest::Client,
     url: reqwest::Url,
     method: reqwest::Method,
     query: Vec<(String, String)>,
+    /// Per-request headers, applied at the request level so they override the client's default headers per-key.
+    headers: HeaderMap,
     body: Option<serde_json::Value>,
-    retries: u32,
+    pub(super) retries: u32,
+}
+
+impl PreparedRequest {
+    /// Assembles the [`reqwest::RequestBuilder`] for one attempt: method, query parameters, per-request header
+    /// overrides, and the optional JSON body. Shared by [`Fetch::text`], [`Fetch::json`], and the download task so the
+    /// request is built identically everywhere.
+    pub(super) fn request(&self) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .request(self.method.clone(), self.url.clone())
+            .query(&self.query)
+            .headers(self.headers.clone());
+        if let Some(body) = &self.body {
+            request = request.json(body);
+        }
+        request
+    }
 }
 
 #[cfg(test)]
@@ -331,38 +432,13 @@ mod tests {
 
     // --- text tests ---
     //
-    // These spin up a throwaway local HTTP/1.1 server on an ephemeral port and point `text` at it, so they
-    // exercise the real request path without reaching the network.
+    // These point `text` at the throwaway local HTTP/1.1 server in `super::test_support`, so they exercise the
+    // real request path without reaching the network.
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    /// Reads an HTTP request from `stream` up to the blank line terminating the headers.
-    async fn read_request(stream: &mut TcpStream) -> String {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut chunk).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    }
-
-    /// Writes a minimal HTTP/1.1 response with the given status line and body.
-    async fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.flush().await.unwrap();
-    }
+    use super::test_support::{read_request, write_response};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn text_returns_body() {
@@ -586,6 +662,84 @@ mod tests {
 
         assert_eq!(body, "recovered");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_is_not_retried_by_default() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // The server only ever answers one request, with a failure. If retries were attempted the client would
+        // hang waiting for a second response; instead the single failure must surface immediately.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "500 Internal Server Error", "fail").await;
+        });
+
+        let err = Fetch::new()
+            .retries(3)
+            .text(
+                format!("http://{addr}"),
+                RequestOptions::new().method(reqwest::Method::POST),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status(), Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_is_retried_when_opted_in() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // First attempt fails...
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "500 Internal Server Error", "fail").await;
+            // ...the opted-in retry succeeds.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "recovered").await;
+        });
+
+        let body = Fetch::new()
+            .retries(1)
+            .text(
+                format!("http://{addr}"),
+                RequestOptions::new()
+                    .method(reqwest::Method::POST)
+                    .retry_non_idempotent(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body, "recovered");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_timeout_errors_on_idle_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // The server accepts and reads the request but never sends a response, leaving the connection idle.
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let err = Fetch::new()
+            .read_timeout(Duration::from_millis(200))
+            .text(format!("http://{addr}"), RequestOptions::new())
+            .await
+            .unwrap_err();
+
+        assert!(err.is_timeout(), "expected a timeout error, got: {err}");
     }
 
     #[tokio::test]

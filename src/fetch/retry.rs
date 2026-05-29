@@ -13,6 +13,7 @@ where
     Fut: Future<Output = Result<T, E>>,
 {
     let mut attempt: u32 = 0;
+
     loop {
         match operation().await {
             Ok(value) => return Ok(value),
@@ -31,6 +32,7 @@ where
 /// Delay (in seconds) before the `n`-th retry (1-based): 1, 2, 3, 5, 8, 13, …
 fn fibonacci_delay(n: u32) -> u64 {
     let (mut prev, mut curr) = (1u64, 2u64); // delays for n=1 and n=2
+
     for _ in 1..n {
         let next = prev + curr;
         prev = curr;

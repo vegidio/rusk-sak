@@ -1,14 +1,16 @@
-//! Per-request configuration for [`Fetch::text`](super::Fetch::text).
+//! Per-request configuration for [`Fetch::text`](super::Fetch::text), [`Fetch::json`](super::Fetch::json), and
+//! [`Fetch::download`](super::Fetch::download).
 
 use reqwest::header::HeaderMap;
 
-/// Per-request overrides applied to a single [`Fetch::text`](super::Fetch::text) call, built with the same fluent
+/// Per-request overrides applied to a single [`Fetch::text`](super::Fetch::text),
+/// [`Fetch::json`](super::Fetch::json), or [`Fetch::download`](super::Fetch::download) call, built with the same fluent
 /// (consuming) builder API as [`Fetch`](super::Fetch).
 ///
 /// Anything set here takes priority over the [`Fetch`](super::Fetch) struct's own configuration for that one request;
-/// anything left unset is inherited from the struct. Headers are merged per-key (request values override struct
-/// values, other struct headers are preserved), query parameters are appended, and the method defaults to `GET`. A
-/// JSON request body can be attached with [`RequestOptions::body`].
+/// anything left unset is inherited from the struct. Headers are merged per-key (request values override struct values,
+/// other struct headers are preserved), query parameters are appended, and the method defaults to `GET`. A JSON request
+/// body can be attached with [`RequestOptions::body`].
 ///
 /// ```
 /// use rust_sak::fetch::RequestOptions;
@@ -18,7 +20,7 @@ use reqwest::header::HeaderMap;
 ///     .query("page", "2")
 ///     .header("Accept", "application/json")
 ///     .retries(5)
-///     .disable_http2(true);
+///     .retry_non_idempotent(true);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
@@ -30,9 +32,9 @@ pub struct RequestOptions {
     pub(super) query: Vec<(String, String)>,
     /// Retry override. `None` inherits the struct's retry count.
     pub(super) retries: Option<u32>,
-    /// HTTP/2 toggle override. `None` inherits the struct's setting; `Some(true)` forces HTTP/1.x, `Some(false)`
-    /// forces HTTP/2 even if the struct disabled it.
-    pub(super) disable_http2: Option<bool>,
+    /// When `true`, allow automatic retries even for non-idempotent methods (e.g. `POST`/`PATCH`). Defaults to
+    /// `false`, so only idempotent methods are retried.
+    pub(super) retry_non_idempotent: bool,
     /// JSON request body, serialized eagerly by [`RequestOptions::body`]. `None` sends no body.
     pub(super) body: Option<serde_json::Value>,
 }
@@ -82,19 +84,27 @@ impl RequestOptions {
     }
 
     /// Overrides the number of retry attempts for this request.
+    ///
+    /// Note that automatic retries apply only to idempotent methods unless [`RequestOptions::retry_non_idempotent`] is
+    /// also set; for a non-idempotent method (e.g. `POST`) without that opt-in, this count is effectively ignored.
     pub fn retries(mut self, retries: u32) -> Self {
         self.retries = Some(retries);
         self
     }
 
-    /// Overrides the HTTP/2 setting for this request: `true` forces HTTP/1.x, `false` forces HTTP/2.
-    pub fn disable_http2(mut self, disable: bool) -> Self {
-        self.disable_http2 = Some(disable);
+    /// Allows automatic retries for non-idempotent methods (e.g. `POST`/`PATCH`).
+    ///
+    /// By default, only idempotent methods (`GET`/`HEAD`/`PUT`/`DELETE`/`OPTIONS`/`TRACE`) are retried, because
+    /// re-sending a `POST`/`PATCH` that failed *after* the server applied its side effect risks a duplicate write. Set
+    /// this to `true` when the endpoint is safe to retry (e.g. idempotent by design or guarded by an idempotency key).
+    pub fn retry_non_idempotent(mut self, allow: bool) -> Self {
+        self.retry_non_idempotent = allow;
         self
     }
 
-    /// Sets a JSON request body, serialized from `body`. Applied by both [`Fetch::text`](super::Fetch::text) and
-    /// [`Fetch::json`](super::Fetch::json), which send it with a `Content-Type: application/json` header.
+    /// Sets a JSON request body, serialized from `body`. Applied by [`Fetch::text`](super::Fetch::text),
+    /// [`Fetch::json`](super::Fetch::json), and [`Fetch::download`](super::Fetch::download), which send it with a
+    /// `Content-Type: application/json` header.
     ///
     /// # Panics
     ///
@@ -116,7 +126,7 @@ mod tests {
         assert!(options.headers.is_empty());
         assert!(options.query.is_empty());
         assert!(options.retries.is_none());
-        assert!(options.disable_http2.is_none());
+        assert!(!options.retry_non_idempotent);
         assert!(options.body.is_none());
     }
 
@@ -128,7 +138,7 @@ mod tests {
             .query("a", "1")
             .query("b", "2")
             .retries(4)
-            .disable_http2(true)
+            .retry_non_idempotent(true)
             .body(serde_json::json!({ "name": "rust" }));
 
         assert_eq!(options.method, Some(reqwest::Method::POST));
@@ -138,14 +148,8 @@ mod tests {
             vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())]
         );
         assert_eq!(options.retries, Some(4));
-        assert_eq!(options.disable_http2, Some(true));
+        assert!(options.retry_non_idempotent);
         assert_eq!(options.body, Some(serde_json::json!({ "name": "rust" })));
-    }
-
-    #[test]
-    fn disable_http2_records_both_states() {
-        assert_eq!(RequestOptions::new().disable_http2(true).disable_http2, Some(true));
-        assert_eq!(RequestOptions::new().disable_http2(false).disable_http2, Some(false));
     }
 
     #[test]

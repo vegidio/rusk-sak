@@ -10,10 +10,10 @@ use std::fmt;
 use std::path::PathBuf;
 
 use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
-use super::{Fetch, PreparedRequest, RequestOptions, retry};
+use super::{retry, PreparedRequest};
 
 /// A snapshot of a download's progress, carried over the [`watch`] channel and returned by [`Download::progress`].
 #[derive(Debug, Clone, Default)]
@@ -93,7 +93,7 @@ impl Download {
 pub enum DownloadError {
     /// The request failed, returned an error status, or the response stream errored.
     Http(reqwest::Error),
-    /// Writing the downloaded bytes to disk failed.
+    /// Writing the downloaded bytes to the disk failed.
     Io(std::io::Error),
 }
 
@@ -141,17 +141,15 @@ fn fraction(total: Option<u64>, downloaded: u64) -> Option<f64> {
 
 /// Drives a download to completion, broadcasting progress over `tx` and returning the final result.
 ///
-/// Called inside the background task spawned by [`Fetch::download`](super::Fetch::download). Setup (`prepare`) happens
-/// here so its errors surface through the handle. On return, a final [`Progress`] with `completed = true` (and `failed`
-/// reflecting the outcome) is sent.
+/// Called inside the background task spawned by [`Fetch::download`](super::Fetch::download). `prepared` carries any
+/// setup error (an invalid URL or a client-build failure) so it surfaces through the handle. On return, a final
+/// [`Progress`] with `completed = true` (and `failed` reflecting the outcome) is sent.
 pub(super) async fn run(
-    fetch: Fetch,
-    url: Result<reqwest::Url, reqwest::Error>,
+    prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
-    options: RequestOptions,
     tx: watch::Sender<Progress>,
 ) -> Result<(), DownloadError> {
-    let result = stream_to_file(fetch, url, path, options, &tx).await;
+    let result = stream_to_file(prepared, path, &tx).await;
     tx.send_modify(|p| {
         p.completed = true;
         p.failed = result.is_err();
@@ -159,34 +157,21 @@ pub(super) async fn run(
     result
 }
 
-/// Resolves the request and streams the response body to `path`, retrying the whole transfer with Fibonacci backoff.
+/// Streams the response body to `path`, retrying the whole transfer with Fibonacci backoff.
 ///
 /// Each attempt truncates the file and resets the progress counters, so a retry restarts cleanly from byte zero.
 async fn stream_to_file(
-    fetch: Fetch,
-    url: Result<reqwest::Url, reqwest::Error>,
+    prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
-    options: RequestOptions,
     tx: &watch::Sender<Progress>,
 ) -> Result<(), DownloadError> {
-    let PreparedRequest {
-        client,
-        url,
-        method,
-        query,
-        body,
-        retries,
-    } = fetch.prepare(url?, options)?;
+    let prepared = prepared?;
 
-    retry::with_fibonacci_backoff(retries, || async {
-        let mut file = tokio::fs::File::create(&path).await?;
+    retry::with_fibonacci_backoff(prepared.retries, || async {
+        let mut file = BufWriter::new(tokio::fs::File::create(&path).await?);
         tx.send_replace(Progress::default());
 
-        let mut request = client.request(method.clone(), url.clone()).query(&query);
-        if let Some(body) = &body {
-            request = request.json(body);
-        }
-        let response = request.send().await?.error_for_status()?;
+        let response = prepared.request().send().await?.error_for_status()?;
 
         let total = response.content_length();
         let mut downloaded: u64 = 0;
@@ -220,41 +205,9 @@ async fn stream_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
-    use tokio::net::{TcpListener, TcpStream};
-
-    /// Reads an HTTP request from `stream` up to the blank line terminating the headers.
-    async fn read_request(stream: &mut TcpStream) {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut chunk).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-    }
-
-    /// Writes a minimal HTTP/1.1 response with a `Content-Length` header.
-    async fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.flush().await.unwrap();
-    }
-
-    /// Writes a 200 response with no `Content-Length`; the body length is implied by the connection close.
-    async fn write_response_no_length(stream: &mut TcpStream, body: &str) {
-        let response = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}");
-        stream.write_all(response.as_bytes()).await.unwrap();
-        stream.flush().await.unwrap();
-    }
+    use crate::fetch::test_support::{read_request, write_response, write_response_no_length};
+    use crate::fetch::{Fetch, RequestOptions};
+    use tokio::net::TcpListener;
 
     /// A unique temp path for a test, keyed by the (unique) ephemeral port the test bound.
     fn temp_path(port: u16) -> PathBuf {
