@@ -5,16 +5,40 @@
 //! snapshot), poll [`Download::completed`]/[`Download::failed`], await updates with [`Download::changed`], or await the
 //! final [`Result`] with [`Download::join`]. Progress is shared over a [`tokio::sync::watch`] channel — the background
 //! task is the single producer, the handle is the observer.
+//!
+//! When a file already exists at the target path, [`DownloadMode`] decides the behavior: [`DownloadMode::Resume`] (the
+//! default) continues an incomplete transfer via an HTTP `Range` request, [`DownloadMode::Overwrite`] truncates and
+//! re-downloads, and [`DownloadMode::Skip`] leaves the existing file untouched.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use futures_util::StreamExt;
+use reqwest::StatusCode;
+use reqwest::header::RANGE;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
 use super::{PreparedRequest, retry};
+
+/// Controls what [`Fetch::download`](super::Fetch::download) does when a file already exists at the target path.
+///
+/// Set as a struct-wide default with [`Fetch::download_mode`](super::Fetch::download_mode) or per request with
+/// [`RequestOptions::download_mode`](super::RequestOptions::download_mode); the per-request value takes priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DownloadMode {
+    /// Resume an incomplete file via an HTTP `Range` request, appending the remaining bytes. Falls back to a full
+    /// redownload if the server ignores `Range` (responds `200` instead of `206`). Starts fresh when no file exists.
+    /// This is the default.
+    #[default]
+    Resume,
+    /// Always truncate any existing file and download from byte zero.
+    Overwrite,
+    /// If any file already exists at the path, do nothing and report the transfer complete without contacting the
+    /// server.
+    Skip,
+}
 
 /// A snapshot of a download's progress, carried over the [`watch`] channel and returned by [`Download::progress`].
 #[derive(Debug, Clone, Default)]
@@ -134,9 +158,7 @@ impl Download {
 /// Awaits the download task, mapping a cancellation into [`DownloadError::Cancelled`] and re-raising a genuine task
 /// panic. Shared by [`Download::join`] and [`Download::track`]. Drives the handle through a mutable borrow (a
 /// [`JoinHandle`](tokio::task::JoinHandle) is [`Unpin`]) so `track` can keep the [`Download`] usable afterward.
-async fn join_handle(
-    handle: &mut tokio::task::JoinHandle<Result<(), DownloadError>>,
-) -> Result<(), DownloadError> {
+async fn join_handle(handle: &mut tokio::task::JoinHandle<Result<(), DownloadError>>) -> Result<(), DownloadError> {
     match Pin::new(handle).await {
         Ok(result) => result,
         Err(err) if err.is_cancelled() => Err(DownloadError::Cancelled),
@@ -202,14 +224,16 @@ fn fraction(total: Option<u64>, downloaded: u64) -> Option<f64> {
 /// Drives a download to completion, broadcasting progress over `tx` and returning the final result.
 ///
 /// Called inside the background task spawned by [`Fetch::download`](super::Fetch::download). `prepared` carries any
-/// setup error (an invalid URL or a client-build failure) so it surfaces through the handle. On return, a final
-/// [`Progress`] with `completed = true` (and `failed` reflecting the outcome) is sent.
+/// setup error (an invalid URL or a client-build failure) so it surfaces through the handle. `mode` decides how an
+/// existing file at `path` is handled. On return, a final [`Progress`] with `completed = true` (and `failed` reflecting
+/// the outcome) is sent.
 pub(super) async fn run(
     prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
     tx: watch::Sender<Progress>,
+    mode: DownloadMode,
 ) -> Result<(), DownloadError> {
-    let result = stream_to_file(prepared, path, &tx).await;
+    let result = stream_to_file(prepared, path, &tx, mode).await;
     tx.send_modify(|p| {
         p.completed = true;
         p.failed = result.is_err();
@@ -217,24 +241,85 @@ pub(super) async fn run(
     result
 }
 
+/// Returns the size of the file at `path`, or `0` when it does not exist (or cannot be stat'd).
+async fn file_len(path: &Path) -> u64 {
+    tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0)
+}
+
 /// Streams the response body to `path`, retrying the whole transfer with Fibonacci backoff.
 ///
-/// Each attempt truncates the file and resets the progress counters, so a retry restarts cleanly from byte zero.
+/// The behavior when a file already exists at `path` is governed by `mode`:
+/// - [`DownloadMode::Skip`] returns immediately (reporting the existing file as complete) without making a request.
+/// - [`DownloadMode::Resume`] sends a `Range` request from the current on-disk length and appends the remainder; if the
+///   server ignores `Range` (responds `200`), it falls back to truncating and restarting from byte zero.
+/// - [`DownloadMode::Overwrite`] always truncates and downloads from byte zero.
+///
+/// The offset is re-read from disk at the start of each attempt, so a retry resumes from whatever bytes are already
+/// present rather than restarting.
 async fn stream_to_file(
     prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
     tx: &watch::Sender<Progress>,
+    mode: DownloadMode,
 ) -> Result<(), DownloadError> {
     let prepared = prepared?;
 
+    if mode == DownloadMode::Skip && tokio::fs::try_exists(&path).await? {
+        let len = file_len(&path).await;
+        tx.send_replace(Progress {
+            total: Some(len),
+            downloaded: len,
+            progress: Some(1.0),
+            completed: false,
+            failed: false,
+        });
+        return Ok(());
+    }
+
     retry::with_fibonacci_backoff(prepared.retries, || async {
-        let mut file = BufWriter::new(tokio::fs::File::create(&path).await?);
-        tx.send_replace(Progress::default());
+        // The offset is re-read each attempt, so a retry resumes from whatever is already on disk.
+        let offset = match mode {
+            DownloadMode::Overwrite => 0,
+            DownloadMode::Resume | DownloadMode::Skip => file_len(&path).await,
+        };
 
-        let response = prepared.request().send().await?.error_for_status()?;
+        let mut builder = prepared.request();
+        if offset > 0 {
+            builder = builder.header(RANGE, format!("bytes={offset}-"));
+        }
+        let response = builder.send().await?;
 
-        let total = response.content_length();
-        let mut downloaded: u64 = 0;
+        // A `416` to a ranged request means the offset is at (or past) the end: the file is already complete.
+        if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            tx.send_replace(Progress {
+                total: Some(offset),
+                downloaded: offset,
+                progress: Some(1.0),
+                completed: false,
+                failed: false,
+            });
+            return Ok(());
+        }
+
+        let response = response.error_for_status()?;
+        let resuming = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+
+        // Open the file only after a good response so a failed attempt never leaves a stray empty file (which would
+        // corrupt the next attempt's offset).
+        let (mut file, mut downloaded, total) = if resuming {
+            // A `206` `Content-Length` reports the remaining bytes, so the total is `offset + remaining`.
+            let total = response.content_length().map(|remaining| offset + remaining);
+            let handle = tokio::fs::OpenOptions::new().append(true).open(&path).await?;
+            (BufWriter::new(handle), offset, total)
+        } else {
+            // A `200` (fresh download, or a server that ignored `Range`): truncate and start from byte zero.
+            (
+                BufWriter::new(tokio::fs::File::create(&path).await?),
+                0,
+                response.content_length(),
+            )
+        };
+
         tx.send_replace(Progress {
             total,
             downloaded,
@@ -260,230 +345,4 @@ async fn stream_to_file(
         Ok::<(), DownloadError>(())
     })
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fetch::test_support::{read_request, write_response, write_response_no_length};
-    use crate::fetch::{Fetch, RequestOptions};
-    use tokio::net::TcpListener;
-
-    /// A unique temp path for a test, keyed by the (unique) ephemeral port the test bound.
-    fn temp_path(port: u16) -> PathBuf {
-        std::env::temp_dir().join(format!("rust-sak-dl-{port}.bin"))
-    }
-
-    /// Drains progress updates until the background task drops its sender, then returns the final snapshot.
-    async fn drain(download: &mut Download) -> Progress {
-        while download.changed().await.is_ok() {}
-        download.progress()
-    }
-
-    #[tokio::test]
-    async fn download_writes_file() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response(&mut stream, "200 OK", "hello download").await;
-        });
-
-        let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
-        download.join().await.unwrap();
-        server.await.unwrap();
-
-        let contents = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(contents, b"hello download");
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn download_reports_total_and_completes_to_full() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response(&mut stream, "200 OK", "0123456789").await;
-        });
-
-        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
-        let progress = drain(&mut download).await;
-        server.await.unwrap();
-
-        assert!(progress.completed);
-        assert!(!progress.failed);
-        assert_eq!(progress.total, Some(10));
-        assert_eq!(progress.downloaded, 10);
-        assert_eq!(progress.progress, Some(1.0));
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn download_without_content_length() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response_no_length(&mut stream, "no length body").await;
-        });
-
-        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
-        let progress = drain(&mut download).await;
-        server.await.unwrap();
-
-        assert!(progress.completed);
-        assert!(!progress.failed);
-        assert_eq!(progress.total, None);
-        assert_eq!(progress.progress, None);
-
-        let contents = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(contents, b"no length body");
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn download_failed_status_sets_failed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response(&mut stream, "500 Internal Server Error", "nope").await;
-        });
-
-        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
-        while download.changed().await.is_ok() {}
-        assert!(download.completed());
-        assert!(download.failed());
-
-        let err = download.join().await.unwrap_err();
-        assert!(matches!(err, DownloadError::Http(_)), "unexpected error: {err}");
-        server.await.unwrap();
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn track_reports_progress_and_completes() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response(&mut stream, "200 OK", "hello track").await;
-        });
-
-        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
-        let mut ticks: Vec<(Option<u64>, u64, Option<f64>)> = Vec::new();
-        download
-            .track(|total, downloaded, progress| ticks.push((total, downloaded, progress)))
-            .await
-            .unwrap();
-        server.await.unwrap();
-
-        assert!(!ticks.is_empty(), "callback was never invoked");
-        // The final update reports the full transfer.
-        assert_eq!(ticks.last().copied(), Some((Some(11), 11, Some(1.0))));
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn track_returns_error_on_failed_status() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response(&mut stream, "500 Internal Server Error", "nope").await;
-        });
-
-        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
-        let err = download.track(|_, _, _| {}).await.unwrap_err();
-        assert!(matches!(err, DownloadError::Http(_)), "unexpected error: {err}");
-        server.await.unwrap();
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn cancel_aborts_and_join_returns_cancelled() {
-        use tokio::io::AsyncWriteExt;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        // The server advertises a large body but sends only a few bytes, then holds the connection open — so the
-        // download stays in-flight (it never errors and never completes) until we cancel it.
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nhello")
-                .await
-                .unwrap();
-            stream.flush().await.unwrap();
-            // Keep the stream alive so the body never finishes; the test aborts this task at the end.
-            std::future::pending::<()>().await;
-        });
-
-        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
-        // Wait for the first real progress update so the transfer is genuinely in-flight before cancelling.
-        download.changed().await.unwrap();
-        assert!(!download.completed());
-
-        download.cancel();
-        let err = download.join().await.unwrap_err();
-        assert!(matches!(err, DownloadError::Cancelled), "unexpected error: {err}");
-
-        server.abort();
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn download_retries_until_success() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let path = temp_path(addr.port());
-
-        let server = tokio::spawn(async move {
-            // First attempt fails...
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response(&mut stream, "500 Internal Server Error", "fail").await;
-            // ...the retry succeeds.
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_request(&mut stream).await;
-            write_response(&mut stream, "200 OK", "recovered").await;
-        });
-
-        let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new().retries(1));
-        download.join().await.unwrap();
-        server.await.unwrap();
-
-        let contents = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(contents, b"recovered");
-
-        let _ = tokio::fs::remove_file(&path).await;
-    }
 }

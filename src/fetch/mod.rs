@@ -17,7 +17,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-pub use download::{Download, DownloadError, Progress};
+pub use download::{Download, DownloadError, DownloadMode, Progress};
 pub use request::RequestOptions;
 
 use std::sync::OnceLock;
@@ -29,7 +29,7 @@ use prepared::PreparedRequest;
 
 /// A configurable, reusable HTTP fetcher, built with a fluent (consuming) builder API.
 ///
-/// A `Fetch` holds the default configuration (headers, retries, HTTP/2 toggle, read timeout) and a lazily built,
+/// A `Fetch` holds the default configuration (headers, retries, HTTP/2 toggle, read timeout, download mode) and a lazily built,
 /// reusable [`reqwest::Client`]. The client — and its connection pool — is constructed on the first request and reused
 /// across later requests, so a `Fetch` is meant to be configured once and shared (the request methods take `&self`).
 /// Mutating the configuration via the builder methods resets the cached client so it is rebuilt with the new settings.
@@ -53,18 +53,23 @@ pub struct Fetch {
     /// Idle timeout applied per read: a request errors if no data arrives within this window (the timer resets on each
     /// successful read). `None` disables it. Defaults to 30 seconds.
     read_timeout: Option<Duration>,
+    /// Default [`DownloadMode`] for [`Fetch::download`], overridable per request via
+    /// [`RequestOptions::download_mode`]. Defaults to [`DownloadMode::Resume`].
+    download_mode: DownloadMode,
     /// Lazily built, reused HTTP client. Cleared by the config builders, so the next request rebuilds it.
     client: OnceLock<reqwest::Client>,
 }
 
 impl Default for Fetch {
-    /// The default configuration: no headers, no retries, HTTP/2 enabled, and a 30-second read (idle) timeout.
+    /// The default configuration: no headers, no retries, HTTP/2 enabled, a 30-second read (idle) timeout, and
+    /// [`DownloadMode::Resume`] for downloads.
     fn default() -> Self {
         Self {
             headers: HeaderMap::new(),
             retries: 0,
             disable_http2: false,
             read_timeout: Some(Duration::from_secs(30)),
+            download_mode: DownloadMode::Resume,
             client: OnceLock::new(),
         }
     }
@@ -79,6 +84,7 @@ impl Clone for Fetch {
             retries: self.retries,
             disable_http2: self.disable_http2,
             read_timeout: self.read_timeout,
+            download_mode: self.download_mode,
             client: OnceLock::new(),
         }
     }
@@ -149,6 +155,21 @@ impl Fetch {
     pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.read_timeout = timeout.into();
         self.client = OnceLock::new();
+        self
+    }
+
+    /// Sets the default [`DownloadMode`] for [`Fetch::download`], controlling what happens when a file already exists at
+    /// the target path. Defaults to [`DownloadMode::Resume`]. Individual requests can override this via
+    /// [`RequestOptions::download_mode`]. Like [`Fetch::retries`], this is not a client-build setting, so it does not
+    /// rebuild the cached client.
+    ///
+    /// ```
+    /// use rust_sak::fetch::{DownloadMode, Fetch};
+    ///
+    /// let fetch = Fetch::new().download_mode(DownloadMode::Overwrite);
+    /// ```
+    pub fn download_mode(mut self, mode: DownloadMode) -> Self {
+        self.download_mode = mode;
         self
     }
 
@@ -291,8 +312,15 @@ impl Fetch {
     ///
     /// The struct's headers, retry count, and HTTP/2 setting provide the defaults, with `options` overriding per the
     /// same rules as [`Fetch::text`] (so non-idempotent methods are not retried unless
-    /// [`RequestOptions::retry_non_idempotent`] opts in). On a retry the whole transfer restarts: the file is truncated
-    /// and re-downloaded from byte zero (there is no `Range`/resume support), so the observed progress briefly resets.
+    /// [`RequestOptions::retry_non_idempotent`] opts in).
+    ///
+    /// When a file already exists at `path`, the resolved [`DownloadMode`] (the struct's
+    /// [`download_mode`](Fetch::download_mode), overridable via [`RequestOptions::download_mode`]) decides the behavior:
+    /// [`DownloadMode::Resume`] (the default) continues an incomplete transfer with an HTTP `Range` request — appending
+    /// the remaining bytes, or falling back to a full redownload if the server ignores `Range`;
+    /// [`DownloadMode::Overwrite`] truncates and re-downloads from byte zero; and [`DownloadMode::Skip`] leaves the
+    /// existing file untouched and reports the transfer complete without contacting the server. On a retry the transfer
+    /// likewise resumes from whatever bytes are already on disk (under `Resume`) rather than restarting.
     ///
     /// All fallible setup is surfaced through the handle rather than from this call: an invalid URL or a client-build
     /// error is captured and reported, alongside a bad HTTP status, a stream error, or a disk-write error, via
@@ -301,6 +329,9 @@ impl Fetch {
     /// # Panics
     ///
     /// Must be called from within a Tokio runtime (it spawns a task); panics otherwise.
+    ///
+    /// The simplest way to follow a download to completion is [`Download::track`], which invokes a callback on every
+    /// progress update and resolves with the final [`Result`]:
     ///
     /// ```no_run
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -312,27 +343,31 @@ impl Fetch {
     ///     RequestOptions::new(),
     /// );
     ///
-    /// while !download.completed() {
-    ///     let progress = download.progress();
-    ///     if let Some(fraction) = progress.progress {
-    ///         println!("{:.0}%", fraction * 100.0);
-    ///     }
-    ///     download.changed().await.ok();
-    /// }
-    /// download.join().await?;
+    /// download
+    ///     .track(|total, downloaded, progress| {
+    ///         match progress {
+    ///             Some(fraction) => println!("{:.0}% ({downloaded} bytes)", fraction * 100.0),
+    ///             None => println!("{downloaded} bytes (unknown total: {total:?})"),
+    ///         }
+    ///     })
+    ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// For finer control you can instead poll [`Download::progress`] and await [`Download::changed`] in a loop, then
+    /// await the final outcome with [`Download::join`].
     pub fn download(
         &self,
         url: impl reqwest::IntoUrl,
         path: impl AsRef<std::path::Path>,
         options: RequestOptions,
     ) -> Download {
+        let mode = options.download_mode.unwrap_or(self.download_mode);
         let prepared = self.prepare(url, options);
         let path = path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::watch::channel(Progress::default());
-        let handle = tokio::spawn(download::run(prepared, path, tx));
+        let handle = tokio::spawn(download::run(prepared, path, tx, mode));
         Download::from_parts(rx, handle)
     }
 }

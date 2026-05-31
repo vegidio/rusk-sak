@@ -40,3 +40,24 @@ pub(super) async fn write_response_no_length(stream: &mut TcpStream, body: &str)
     stream.write_all(response.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
 }
+
+/// Writes a `206 Partial Content` response carrying `body` as the bytes `start..start+body.len()` of a resource whose
+/// full size is `total`, with the matching `Content-Range`/`Content-Length` headers. Used to exercise resume.
+pub(super) async fn write_partial_response(stream: &mut TcpStream, start: u64, total: u64, body: &str) {
+    let end = start + body.len() as u64 - 1;
+    let response = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+/// Writes a bare `416 Range Not Satisfiable` response (no body). Used to exercise the "already complete" resume path.
+pub(super) async fn write_range_not_satisfiable(stream: &mut TcpStream, total: u64) {
+    let response = format!(
+        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+}

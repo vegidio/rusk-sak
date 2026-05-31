@@ -3,6 +3,8 @@
 
 use reqwest::header::HeaderMap;
 
+use super::DownloadMode;
+
 /// Per-request overrides applied to a single [`Fetch::text`](super::Fetch::text),
 /// [`Fetch::json`](super::Fetch::json), or [`Fetch::download`](super::Fetch::download) call, built with the same fluent
 /// (consuming) builder API as [`Fetch`](super::Fetch).
@@ -37,6 +39,9 @@ pub struct RequestOptions {
     pub(super) retry_non_idempotent: bool,
     /// JSON request body, serialized eagerly by [`RequestOptions::body`]. `None` sends no body.
     pub(super) body: Option<serde_json::Value>,
+    /// Download behavior when a file already exists at the target path (only used by
+    /// [`Fetch::download`](super::Fetch::download)). `None` inherits the struct's default.
+    pub(super) download_mode: Option<DownloadMode>,
 }
 
 impl RequestOptions {
@@ -113,6 +118,14 @@ impl RequestOptions {
         self.body = Some(serde_json::to_value(body).expect("request body is not serializable to JSON"));
         self
     }
+
+    /// Sets the [`DownloadMode`] for this [`Fetch::download`](super::Fetch::download) call, overriding the struct's
+    /// default. Has no effect on [`Fetch::text`](super::Fetch::text) or [`Fetch::json`](super::Fetch::json). When left
+    /// unset, the [`Fetch`](super::Fetch) struct's [`download_mode`](super::Fetch::download_mode) is used.
+    pub fn download_mode(mut self, mode: DownloadMode) -> Self {
+        self.download_mode = Some(mode);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +141,7 @@ mod tests {
         assert!(options.retries.is_none());
         assert!(!options.retry_non_idempotent);
         assert!(options.body.is_none());
+        assert!(options.download_mode.is_none());
     }
 
     #[test]
@@ -139,7 +153,8 @@ mod tests {
             .query("b", "2")
             .retries(4)
             .retry_non_idempotent(true)
-            .body(serde_json::json!({ "name": "rust" }));
+            .body(serde_json::json!({ "name": "rust" }))
+            .download_mode(DownloadMode::Skip);
 
         assert_eq!(options.method, Some(reqwest::Method::POST));
         assert_eq!(options.headers.get("Accept").unwrap(), "application/json");
@@ -150,6 +165,7 @@ mod tests {
         assert_eq!(options.retries, Some(4));
         assert!(options.retry_non_idempotent);
         assert_eq!(options.body, Some(serde_json::json!({ "name": "rust" })));
+        assert_eq!(options.download_mode, Some(DownloadMode::Skip));
     }
 
     #[test]
