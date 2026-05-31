@@ -726,6 +726,53 @@ async fn resume_falls_back_when_server_ignores_range() {
 }
 
 #[tokio::test]
+async fn resume_rejects_206_with_mismatched_content_range() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+
+    // Pre-seed a 4-byte partial; the client will request `bytes=4-`.
+    let _ = tokio::fs::remove_file(&path).await;
+    tokio::fs::write(&path, b"0123").await.unwrap();
+
+    let server = tokio::spawn(async move {
+        // First attempt: a 206 that lies about its range — it claims to start at byte 0, not the requested 4.
+        // Appending its body would corrupt the file, so the transfer must reject it and restart from scratch.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            request.contains("bytes=4-"),
+            "expected a resume Range header, got: {request}"
+        );
+        write_partial_response(&mut stream, 0, 10, "BADBADBAD!").await;
+        // Retry: the partial was discarded, so no Range header is sent and the server returns the full body.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            !request.to_lowercase().contains("range:"),
+            "after a rejected 206 the retry must restart without a Range header, got: {request}"
+        );
+        write_response(&mut stream, "200 OK", "0123456789").await;
+    });
+
+    let mut download = Fetch::new()
+        .retries(1)
+        .download(format!("http://{addr}"), &path, RequestOptions::new());
+    let progress = drain(&mut download).await;
+    server.await.unwrap();
+
+    assert!(progress.completed);
+    assert!(!progress.failed);
+    assert_eq!(progress.downloaded, 10);
+
+    // The mismatched partial body was never appended; the retry produced the correct full file.
+    let contents = tokio::fs::read(&path).await.unwrap();
+    assert_eq!(contents, b"0123456789");
+
+    let _ = tokio::fs::remove_file(&path).await;
+}
+
+#[tokio::test]
 async fn skip_when_file_exists() {
     // Bind a listener to reserve a port but never accept: Skip must not make a request.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -16,7 +16,7 @@ use std::pin::Pin;
 
 use futures_util::StreamExt;
 use reqwest::StatusCode;
-use reqwest::header::RANGE;
+use reqwest::header::{CONTENT_RANGE, RANGE};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
@@ -53,6 +53,21 @@ pub struct Progress {
     pub completed: bool,
     /// `true` when the transfer finished with an error.
     pub failed: bool,
+}
+
+impl Progress {
+    /// Builds an in-flight snapshot: `progress` is derived from `total`/`downloaded` via [`fraction`] and both terminal
+    /// flags are `false`. The background task sets `completed`/`failed` once via [`watch::Sender::send_modify`] in
+    /// [`run`] when the transfer ends.
+    fn in_flight(total: Option<u64>, downloaded: u64) -> Self {
+        Self {
+            total,
+            downloaded,
+            progress: fraction(total, downloaded),
+            completed: false,
+            failed: false,
+        }
+    }
 }
 
 /// Handle to an in-flight (or finished) download started by [`Fetch::download`](super::Fetch::download).
@@ -209,6 +224,17 @@ impl From<std::io::Error> for DownloadError {
     }
 }
 
+/// Parses the first-byte position from a `206` response's `Content-Range` header (e.g. `bytes 1024-2047/4096` → `1024`).
+///
+/// Returns `None` when the header is absent, not valid UTF-8, or malformed — any of which makes the partial response
+/// untrustworthy for a resume.
+fn content_range_start(response: &reqwest::Response) -> Option<u64> {
+    let value = response.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    // RFC 9110 form: "bytes <start>-<end>/<complete-length|*>".
+    let start = value.strip_prefix("bytes ")?.split('-').next()?;
+    start.trim().parse::<u64>().ok()
+}
+
 /// Computes the completion fraction, clamped to `0.0..=1.0`. `None` when the total is unknown; a known total of zero
 /// (an empty file) is reported as fully complete.
 fn fraction(total: Option<u64>, downloaded: u64) -> Option<f64> {
@@ -241,9 +267,17 @@ pub(super) async fn run(
     result
 }
 
-/// Returns the size of the file at `path`, or `0` when it does not exist (or cannot be stat'd).
-async fn file_len(path: &Path) -> u64 {
-    tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0)
+/// Returns the size of the file at `path`, or `0` when it does not exist.
+///
+/// Only a `NotFound` error maps to `0` (the "start fresh" case). Any other stat failure — e.g. a permission error —
+/// is surfaced rather than silently treated as an empty file, which would otherwise let `Resume` truncate an existing
+/// but un-stat'able file.
+async fn file_len(path: &Path) -> std::io::Result<u64> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => Ok(meta.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err),
+    }
 }
 
 /// Streams the response body to `path`, retrying the whole transfer with Fibonacci backoff.
@@ -265,14 +299,8 @@ async fn stream_to_file(
     let prepared = prepared?;
 
     if mode == DownloadMode::Skip && tokio::fs::try_exists(&path).await? {
-        let len = file_len(&path).await;
-        tx.send_replace(Progress {
-            total: Some(len),
-            downloaded: len,
-            progress: Some(1.0),
-            completed: false,
-            failed: false,
-        });
+        let len = file_len(&path).await?;
+        tx.send_replace(Progress::in_flight(Some(len), len));
         return Ok(());
     }
 
@@ -280,7 +308,7 @@ async fn stream_to_file(
         // The offset is re-read each attempt, so a retry resumes from whatever is already on disk.
         let offset = match mode {
             DownloadMode::Overwrite => 0,
-            DownloadMode::Resume | DownloadMode::Skip => file_len(&path).await,
+            DownloadMode::Resume | DownloadMode::Skip => file_len(&path).await?,
         };
 
         let mut builder = prepared.request();
@@ -291,18 +319,26 @@ async fn stream_to_file(
 
         // A `416` to a ranged request means the offset is at (or past) the end: the file is already complete.
         if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-            tx.send_replace(Progress {
-                total: Some(offset),
-                downloaded: offset,
-                progress: Some(1.0),
-                completed: false,
-                failed: false,
-            });
+            tx.send_replace(Progress::in_flight(Some(offset), offset));
             return Ok(());
         }
 
         let response = response.error_for_status()?;
-        let resuming = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+        let partial = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+
+        // A `206` is only a trustworthy resume if its `Content-Range` begins exactly at the byte we asked for. A
+        // server that ignored `Range` answers `200` (handled as a fresh download below); one that returns a `206` for
+        // some *other* range would corrupt the file if we blindly appended its body. Reject it: discard the partial
+        // file so the next attempt re-reads a zero offset and re-requests without `Range`, and error out so the retry
+        // (or a final failure) kicks in rather than writing bad bytes.
+        if partial && content_range_start(&response) != Some(offset) {
+            tokio::fs::File::create(&path).await?;
+            return Err(DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "server returned a 206 whose Content-Range does not match the requested offset",
+            )));
+        }
+        let resuming = partial;
 
         // Open the file only after a good response so a failed attempt never leaves a stray empty file (which would
         // corrupt the next attempt's offset).
@@ -320,26 +356,14 @@ async fn stream_to_file(
             )
         };
 
-        tx.send_replace(Progress {
-            total,
-            downloaded,
-            progress: fraction(total, downloaded),
-            completed: false,
-            failed: false,
-        });
+        tx.send_replace(Progress::in_flight(total, downloaded));
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
-            tx.send_replace(Progress {
-                total,
-                downloaded,
-                progress: fraction(total, downloaded),
-                completed: false,
-                failed: false,
-            });
+            tx.send_replace(Progress::in_flight(total, downloaded));
         }
         file.flush().await?;
         Ok::<(), DownloadError>(())
